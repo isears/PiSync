@@ -1,0 +1,148 @@
+PiSync: A home file server using Raspberry Pi!
+==============================================
+
+
+GOALS
+-----
+This project aims to create a lightweight, platform independent file-sharing program using a home-installed RaspberryPi
+and external hard drive as the only server infrastructure. Although some configurations are required on the server-side,
+ALL CODE RUNS ON THE CLIENT SIDE. PiSync emulates Dropbox in that it attempts to clone and keep up-to-date a virtual
+file system on all connected devices by propogating updates through a centralized server.
+
+
+DEPENDENCIES
+------------
+The script assumes the following about the client side:
+- python3
+- paramiko python package (only non-default python package required)
+
+The script assumes the following about the server side:
+- User has administrative access to his/her home router
+- User's home router has a public IP address (most do)
+- User's home router is capable of port forwarding
+- User has a raspberry pi with a working OS installed (this script was tested using Raspbian OS)
+
+
+SETUP (SERVER CONFIGURATION)
+----------------------------
+1.) Install Raspbian OS on Raspberry Pi
+2.) Attach external hard drive via USB (it is recommended to use a powered USB hub to prevent larger USB drives from
+    drawing too much power and causing the Raspberry Pi to crash).
+3.) Mount the external hard drive (must use root privileges):
+    - use 'fdisk -l' command to find the location of the external drive (should be something like /dev/sda1)
+    - create mountpoint: e.g. 'mkdir /media/USBHDD1' (remember this mountpoint for client-side configuration)
+    - execute: 'mount -t auto <location of drive> <mountpoint>'
+    - verify the drive was mounted by executing 'df -h' which will return a list of filesystems.
+4.) Configure port-forwarding on router. It is recommended that a non-standard port (something above 1024) on the router
+    be forwarded to port 22 on the Pi.
+
+* Recommended additional security configurations:
+    - Create a low-privilege user specifically to use for PiSync connections
+    - Configure publickey-only auth (requires public keys of every client to be added to '~/.ssh/authorized_keys')
+    - Restrict the SFTP user to SFTP-only connection
+
+
+SETUP (CLIENT CONFIGURATION)
+----------------------------
+1.) Create .PiSync directory in home directory. This will be where config and logs are stored. For example:
+    - OSX: /Users/<Username>/.PiSync
+    - Linux: /home/<Username>/.PiSync
+    - Windows: C:\Users\<Username>\.PiSync
+
+2.) Create PiSync directory in home directory. This will be the directory that will be sync'd with the server.
+3.) Create pisync.ini file within .PiSync directory. Use example template as a guide for what the contents should look
+    like.
+4.) Install an appropriate startup script in Linux/OSX crontabs or Windows startup directory. Use PiSyncStart example
+    scripts as a guide if necessary.
+    - Consider running PiSync.py script from command line on the first run to ensure everything is working properly.
+    Read messages in .PiSync/log.txt to troubleshoot any problems.
+5.) Restart device.
+
+
+ALGORITHM: HIGH-LEVEL SUMMARY
+-----------------------------
+The PiSync algorithm is essentially a state machine that determines which files to download/upload to/from the server
+based on said file's presence/absence in both remote and local file systems. The state machine requires not only
+knowledge of the current local and remote directory trees, but also the directory trees that existed at the beginning
+of the previous cycle. Below is a table of states:
+
+lp = local file present in previous cycle
+lc = local file present in current cycle
+rp = remote file present in previous cycle
+rc = remote file present in current cycle
+
+        | rp + rc | rp | rc | none |
+------------------------------------
+lp + lc | s1      | s2 | s3 | s4   |
+lp      | s5      | s6 | s7 | s8   |
+lc      | s9      | s10| s11| s12  |
+none    | s13     | s14| s15| s16  |
+------------------------------------
+
+s1: Both remote and local file exists in current and previous cycle. This state is the majority case as it represents a
+    a file that has remained unchanged in both filesystems. The script takes no action in this case
+s2: The local file exists in current and previous cycle, but the remote file only existed in the previous cycle. This
+    means the file was removed from the server's filesystem, indicating it was deleted (e.g., by another connected
+    client). The script deletes the file from the local filesystem in this case.
+s3: The local file exists in current and previous cycle, but the remote file only exists in the current cycle. This
+    usually means that the file was recently added on the local file system, and successfully pushed to the server in
+    the last cycle. The script takes no action in this state.
+s4: The local file exists in current and previous cycle, but the remote does not exist in either cycle. This should not
+    normally happen and indicates that the local host has failed to push a file system change to the remote server in
+    the past. The script attempts to push the file to the server again in this state.
+s5: The local file exists in only the previous cycle, and the remote file exists in both previous and current cycles.
+    This  indicates that the local file was deleted between the previous and current cycles. The script attempts to
+    delete the corresponding remote file in this state.
+s6: The local file exists in only the previous cycle, and the remote file exists in the previous cycle. This state
+    indicates a simultaneous delete on both the local file system and remote file system (which is frankly a little
+    strange). The script does nothing in this state.
+s7: The local file exists in only the previous cycle, and the remote file exists in the current cycle. Although rare,
+    this state could indicate that the local file was pushed to the server in the last cycle, but deleted on the local
+    file system sometime between the previous and current cycles. The script attempts to delete the remote file in this
+    state.
+s8: The local file exists in only the previous cycle, and the remote file does not exist in either the current or
+    previous cycle. This state indicates that the local file was deleted, but never existed on the remote server. The
+    script takes no action in this case.
+s9: The local file exists in only the current cycle, and the remote file exists in both the current and previous cycles.
+    This state indicates that the remote file was successfully pulled in the last cycle. The script takes no action in
+    this case.
+s10:The local file exists in only the current cycle, and the remote file exists in only the previous cycle. This state
+    indicates that the remote file was deleted at the same time that a local file of the same name was created. In this
+    state the script takes the safer action of re-uploading the local file.
+s11:The local file exists in only the current cycle, and the remote file exists in only the current cycle. This state
+    indicates that a remote and local file of the same name were created simultaneously. In this case, the script
+    compares timestamps on the files and uses the most up-to-date file to update the older file.
+s12:The local file exists in only the current cycle, and the remote file does not exist in either cycle. This indicates
+    that a local file has just been created. In this case the script attempts to push a copy of the local file to the
+    server.
+s13:The local file does not exist in either cycle and the remote file exists in both the current and previous cycle.
+    This indicates that the last cycle pull from the server somehow failed. In this case the script attempts to pull the
+    file from the server again.
+s14:The local file does not exist in either cycle and the remote file exists in only the previous cycle. This indicates
+    that the local file was deleted two cycles ago and the delete was successfully propagated to the remote server. In
+    this case the script takes no action.
+s15:The local file does not exist in either cycle and the remote file exists in only the current cycle. This indicates
+    that a file has just been added to the remote filesystem (e.g., from another connected device). In this case the
+    script attempts to copy the remote file to the local filesystem.
+s16:Neither local file nor remote file exists in either cycle. This is a dummy case only present for the sake of
+    completeness.
+
+
+TODOS
+-----
+This project is still a little rough around the edges. Unfortunately I don't have a whole lot of time to work on it
+anymore so I probably won't be providing future updates/bug fixes. That said, anyone who wants to build on this is
+welcome to fork it and do whatever. Below is a list of some possible issues as well as potentially useful features that
+never got implemented.
+
+- Support for CLI-only environments (in current state tkinter window is necessary to get SFTP passwords at runtime, but
+in windowless environments it might make more sense to store the password in a config file, even if this is inherently
+insecure)
+- Still not 100% confident in the script's ability to recover from network errors. May need more rigorous exception
+handling in the loop in function main().
+- Tkinter window doesn't grab focus when it first pops up. Would be much smoother if the window could pop up and grab
+focus so that the user could just type in the SFTP password and press 'enter' instead of having to click on the window
+first.
+- There is no diff'ing of files. This means that whenever a change is detected in a file (even if it's a single
+character) the script replaces the entire file with the updated version. Although this is probably fine for smaller
+files, it is horribly inefficient and could cause problems at scale.
